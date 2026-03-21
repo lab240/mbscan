@@ -5,27 +5,80 @@
  * by sending a Modbus RTU Read Holding Registers (FC03) request.
  * Reports responding devices with register values.
  *
- * No external dependencies — pure POSIX + own CRC16 implementation.
+ * Cross-platform: Linux (POSIX termios) + Windows (Win32 API).
+ * No external dependencies — pure C with own CRC16 implementation.
+ *
+ * Linux:   gcc -O2 -Wall -o mbscan mbscan.c
+ * Windows: cl mbscan.c /Fe:mbscan.exe
+ *          (or: gcc -O2 -Wall -o mbscan.exe mbscan.c on MSYS2/MinGW)
  *
  * Usage: mbscan -p /dev/ttyUSB0 [-b 115200] [-d 8N1] [-f 1] [-t 247]
- *              [-o 100] [-r 1] [-c 1]
+ *              [-o 100] [-r 0] [-c 1] [-v]
+ *
+ * Windows: mbscan -p COM3 [-b 115200] [-d 8N1] ...
  *
  * (c) 2025 NapiLab, GPL-2.0
  */
 
+#ifndef _WIN32
+  #define _DEFAULT_SOURCE   /* usleep() on glibc */
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <termios.h>
-#include <sys/time.h>
-#include <sys/select.h>
-#include <getopt.h>
 #include <stdint.h>
 
-/* ---- Modbus CRC16 ---- */
+#ifdef _WIN32
+  #include <windows.h>
+#else
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <errno.h>
+  #include <termios.h>
+  #include <sys/time.h>
+  #include <sys/select.h>
+  #include <getopt.h>
+#endif
+
+/* ================================================================
+ * Minimal getopt for Windows (MSVC has no getopt)
+ * ================================================================ */
+
+#ifdef _WIN32
+
+static char *optarg = NULL;
+static int   optind = 1;
+
+static int getopt(int argc, char *const argv[], const char *optstring)
+{
+    if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
+        return -1;
+
+    char opt = argv[optind][1];
+    const char *p = strchr(optstring, opt);
+    if (!p)
+        return '?';
+
+    optind++;
+
+    if (p[1] == ':') {
+        if (optind >= argc) {
+            fprintf(stderr, "Option -%c requires an argument\n", opt);
+            return '?';
+        }
+        optarg = argv[optind++];
+    }
+
+    return opt;
+}
+
+#endif /* _WIN32 */
+
+
+/* ================================================================
+ * Modbus CRC16 (platform-independent)
+ * ================================================================ */
 
 static const uint16_t crc_table[256] = {
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
@@ -71,7 +124,264 @@ static uint16_t modbus_crc16(const uint8_t *data, size_t len)
     return crc;
 }
 
-/* ---- Serial port ---- */
+/* ================================================================
+ * Modbus RTU request/response (platform-independent)
+ * ================================================================ */
+
+/*
+ * Build FC03 (Read Holding Registers) request frame.
+ * Returns frame length (always 8).
+ */
+static int build_fc03_request(uint8_t *buf, uint8_t slave, uint16_t start_reg, uint16_t count)
+{
+    buf[0] = slave;
+    buf[1] = 0x03;                    /* FC03 */
+    buf[2] = (start_reg >> 8) & 0xFF; /* Start register high */
+    buf[3] = start_reg & 0xFF;        /* Start register low */
+    buf[4] = (count >> 8) & 0xFF;     /* Count high */
+    buf[5] = count & 0xFF;            /* Count low */
+
+    uint16_t crc = modbus_crc16(buf, 6);
+    buf[6] = crc & 0xFF;              /* CRC low */
+    buf[7] = (crc >> 8) & 0xFF;       /* CRC high */
+
+    return 8;
+}
+
+/*
+ * Validate response CRC and structure.
+ * Returns 1 if valid FC03 response, 0 otherwise.
+ */
+static int validate_response(const uint8_t *buf, int len, uint8_t slave)
+{
+    if (len < 5)
+        return 0;
+
+    /* Check slave address */
+    if (buf[0] != slave)
+        return 0;
+
+    /* Check CRC */
+    uint16_t crc_calc = modbus_crc16(buf, len - 2);
+    uint16_t crc_recv = buf[len - 2] | (buf[len - 1] << 8);
+    if (crc_calc != crc_recv)
+        return 0;
+
+    /* Exception? */
+    if (buf[1] & 0x80)
+        return 0;
+
+    /* FC03 response */
+    if (buf[1] != 0x03)
+        return 0;
+
+    return 1;
+}
+
+
+/* ================================================================
+ * Platform-specific serial port layer
+ * ================================================================ */
+
+#ifdef _WIN32
+
+/* ---- Windows: Win32 serial API ---- */
+
+typedef HANDLE serial_t;
+#define SERIAL_INVALID INVALID_HANDLE_VALUE
+
+static serial_t open_serial(const char *port, int baud, char parity, int databits, int stopbits)
+{
+    /*
+     * Windows COM port names above COM9 require the \\.\COMxx prefix.
+     * We always use this form for safety — it works for COM1-COM9 too.
+     */
+    char devpath[64];
+    if (strncmp(port, "\\\\.\\", 4) == 0 || strncmp(port, "//./", 4) == 0) {
+        snprintf(devpath, sizeof(devpath), "%s", port);
+    } else {
+        snprintf(devpath, sizeof(devpath), "\\\\.\\%s", port);
+    }
+
+    HANDLE hComm = CreateFileA(
+        devpath,
+        GENERIC_READ | GENERIC_WRITE,
+        0,              /* No sharing */
+        NULL,           /* Default security */
+        OPEN_EXISTING,
+        0,              /* Synchronous I/O */
+        NULL
+    );
+
+    if (hComm == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Cannot open %s: error %lu\n", port, GetLastError());
+        return INVALID_HANDLE_VALUE;
+    }
+
+    /* Configure port parameters */
+    DCB dcb;
+    memset(&dcb, 0, sizeof(dcb));
+    dcb.DCBlength = sizeof(dcb);
+
+    if (!GetCommState(hComm, &dcb)) {
+        fprintf(stderr, "GetCommState failed: error %lu\n", GetLastError());
+        CloseHandle(hComm);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    dcb.BaudRate = baud;
+
+    /* Data bits */
+    dcb.ByteSize = (BYTE)databits;
+
+    /* Parity */
+    switch (parity) {
+        case 'E': case 'e':
+            dcb.Parity = EVENPARITY;
+            break;
+        case 'O': case 'o':
+            dcb.Parity = ODDPARITY;
+            break;
+        default:
+            dcb.Parity = NOPARITY;
+            break;
+    }
+
+    /* Stop bits */
+    dcb.StopBits = (stopbits == 2) ? TWOSTOPBITS : ONESTOPBIT;
+
+    /* Disable flow control */
+    dcb.fOutxCtsFlow = FALSE;
+    dcb.fOutxDsrFlow = FALSE;
+    dcb.fDtrControl  = DTR_CONTROL_DISABLE;
+    dcb.fRtsControl  = RTS_CONTROL_DISABLE;
+    dcb.fOutX        = FALSE;
+    dcb.fInX         = FALSE;
+
+    /* Binary mode, no EOF check */
+    dcb.fBinary = TRUE;
+    dcb.fParity = (parity != 'N' && parity != 'n') ? TRUE : FALSE;
+
+    if (!SetCommState(hComm, &dcb)) {
+        fprintf(stderr, "SetCommState failed: error %lu\n", GetLastError());
+        CloseHandle(hComm);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    /*
+     * Timeouts: we manage per-address timeout in read_response().
+     * Set ReadFile to return immediately (non-blocking reads),
+     * so we can implement our own timeout loop.
+     */
+    COMMTIMEOUTS timeouts;
+    timeouts.ReadIntervalTimeout         = MAXDWORD;
+    timeouts.ReadTotalTimeoutMultiplier  = 0;
+    timeouts.ReadTotalTimeoutConstant    = 0;
+    timeouts.WriteTotalTimeoutMultiplier = 0;
+    timeouts.WriteTotalTimeoutConstant   = 1000; /* 1 s write timeout */
+
+    if (!SetCommTimeouts(hComm, &timeouts)) {
+        fprintf(stderr, "SetCommTimeouts failed: error %lu\n", GetLastError());
+        CloseHandle(hComm);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    /* Purge any stale data */
+    PurgeComm(hComm, PURGE_RXCLEAR | PURGE_TXCLEAR);
+
+    return hComm;
+}
+
+static void close_serial(serial_t h)
+{
+    if (h != INVALID_HANDLE_VALUE)
+        CloseHandle(h);
+}
+
+static void flush_serial(serial_t h)
+{
+    PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+}
+
+static int write_serial(serial_t h, const uint8_t *data, int len)
+{
+    DWORD written = 0;
+    if (!WriteFile(h, data, (DWORD)len, &written, NULL))
+        return -1;
+    /* Flush transmit buffer (equivalent to tcdrain) */
+    FlushFileBuffers(h);
+    return (int)written;
+}
+
+/*
+ * Read response with timeout (ms).
+ * Uses polling loop with GetTickCount64 for timing.
+ * ReadFile is set to non-blocking (returns immediately),
+ * we sleep 1ms between polls to avoid busy-waiting.
+ * Returns bytes read, 0 on timeout.
+ */
+static int read_response(serial_t h, uint8_t *buf, size_t bufsize, int timeout_ms)
+{
+    int total = 0;
+    ULONGLONG start = GetTickCount64();
+
+    while (total < (int)bufsize) {
+        ULONGLONG now = GetTickCount64();
+        if ((int)(now - start) >= timeout_ms)
+            break;
+
+        DWORD nread = 0;
+        if (!ReadFile(h, buf + total, (DWORD)(bufsize - total), &nread, NULL))
+            return -1;
+
+        if (nread > 0) {
+            total += (int)nread;
+        } else {
+            /* No data available yet — sleep briefly to avoid 100% CPU */
+            Sleep(1);
+        }
+
+        /*
+         * For FC03 response: slave(1) + fc(1) + byte_count(1) + data(N) + crc(2)
+         * Once we have at least 5 bytes, we know the expected length.
+         */
+        if (total >= 5) {
+            int expected;
+            if (buf[1] & 0x80) {
+                /* Exception: slave + fc|0x80 + exception_code + crc(2) = 5 */
+                expected = 5;
+            } else {
+                /* Normal: 3 + byte_count + 2 */
+                expected = 3 + buf[2] + 2;
+            }
+            if (total >= expected)
+                break;
+        }
+    }
+
+    return total;
+}
+
+/*
+ * Modbus inter-frame delay.
+ */
+static void inter_frame_delay(int baud)
+{
+    int delay_ms;
+    if (baud <= 19200)
+        delay_ms = (3500 * 11) / baud + 1;
+    else
+        delay_ms = 2;
+
+    Sleep(delay_ms);
+}
+
+#else
+
+/* ---- Linux/POSIX: termios serial API ---- */
+
+typedef int serial_t;
+#define SERIAL_INVALID (-1)
 
 static speed_t baud_to_speed(int baud)
 {
@@ -90,7 +400,7 @@ static speed_t baud_to_speed(int baud)
     }
 }
 
-static int open_serial(const char *port, int baud, char parity, int databits, int stopbits)
+static serial_t open_serial(const char *port, int baud, char parity, int databits, int stopbits)
 {
     int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
@@ -151,33 +461,30 @@ static int open_serial(const char *port, int baud, char parity, int databits, in
     return fd;
 }
 
-/* ---- Modbus RTU request/response ---- */
-
-/*
- * Build FC03 (Read Holding Registers) request frame.
- * Returns frame length (always 8).
- */
-static int build_fc03_request(uint8_t *buf, uint8_t slave, uint16_t start_reg, uint16_t count)
+static void close_serial(serial_t fd)
 {
-    buf[0] = slave;
-    buf[1] = 0x03;                    /* FC03 */
-    buf[2] = (start_reg >> 8) & 0xFF; /* Start register high */
-    buf[3] = start_reg & 0xFF;        /* Start register low */
-    buf[4] = (count >> 8) & 0xFF;     /* Count high */
-    buf[5] = count & 0xFF;            /* Count low */
+    if (fd >= 0)
+        close(fd);
+}
 
-    uint16_t crc = modbus_crc16(buf, 6);
-    buf[6] = crc & 0xFF;              /* CRC low */
-    buf[7] = (crc >> 8) & 0xFF;       /* CRC high */
+static void flush_serial(serial_t fd)
+{
+    tcflush(fd, TCIOFLUSH);
+}
 
-    return 8;
+static int write_serial(serial_t fd, const uint8_t *data, int len)
+{
+    int written = write(fd, data, len);
+    if (written > 0)
+        tcdrain(fd);
+    return written;
 }
 
 /*
  * Wait for response with timeout (milliseconds).
  * Returns bytes read, 0 on timeout, -1 on error.
  */
-static int read_response(int fd, uint8_t *buf, size_t bufsize, int timeout_ms)
+static int read_response(serial_t fd, uint8_t *buf, size_t bufsize, int timeout_ms)
 {
     int total = 0;
     struct timeval start, now;
@@ -239,42 +546,7 @@ static int read_response(int fd, uint8_t *buf, size_t bufsize, int timeout_ms)
 }
 
 /*
- * Validate response CRC and structure.
- * Returns 1 if valid FC03 response, 0 otherwise.
- */
-static int validate_response(const uint8_t *buf, int len, uint8_t slave)
-{
-    if (len < 5)
-        return 0;
-
-    /* Check slave address */
-    if (buf[0] != slave)
-        return 0;
-
-    /* Check CRC */
-    uint16_t crc_calc = modbus_crc16(buf, len - 2);
-    uint16_t crc_recv = buf[len - 2] | (buf[len - 1] << 8);
-    if (crc_calc != crc_recv)
-        return 0;
-
-    /* Exception? */
-    if (buf[1] & 0x80)
-        return 0;
-
-    /* FC03 response */
-    if (buf[1] != 0x03)
-        return 0;
-
-    return 1;
-}
-
-/* ---- Inter-frame delay ---- */
-
-/*
- * Modbus RTU requires 3.5 character times of silence between frames.
- * At 9600 baud: 3.5 * 11 bits / 9600 = ~4 ms
- * At 115200 baud: ~0.33 ms
- * We use a minimum of 2 ms for safety.
+ * Modbus inter-frame delay.
  */
 static void inter_frame_delay(int baud)
 {
@@ -287,7 +559,12 @@ static void inter_frame_delay(int baud)
     usleep(delay_us);
 }
 
-/* ---- Usage ---- */
+#endif /* _WIN32 / POSIX */
+
+
+/* ================================================================
+ * Usage and main (platform-independent)
+ * ================================================================ */
 
 static void usage(const char *prog)
 {
@@ -297,7 +574,12 @@ static void usage(const char *prog)
         "Modbus RTU bus scanner. Sends FC03 to each address and reports responses.\n"
         "\n"
         "Options:\n"
-        "  -p PORT    Serial port (required, e.g. /dev/ttyUSB0)\n"
+        "  -p PORT    Serial port (required)\n"
+#ifdef _WIN32
+        "             Windows: COM3, COM10, \\\\.\\COM15\n"
+#else
+        "             Linux: /dev/ttyUSB0, /dev/ttyS1\n"
+#endif
         "  -b BAUD    Baud rate (default: 115200)\n"
         "  -d PARAMS  Data format: 8N1, 8E1, 8O1, 7E1, etc. (default: 8N1)\n"
         "  -f FROM    Start address (default: 1)\n"
@@ -309,13 +591,16 @@ static void usage(const char *prog)
         "  -h         Show this help\n"
         "\n"
         "Examples:\n"
+#ifdef _WIN32
+        "  %s -p COM3\n"
+        "  %s -p COM5 -b 9600 -d 8E1 -f 1 -t 30 -o 200\n"
+#else
         "  %s -p /dev/ttyUSB0\n"
         "  %s -p /dev/ttyS1 -b 9600 -d 8E1 -f 1 -t 30 -o 200\n"
+#endif
         "\n",
         prog, prog, prog);
 }
-
-/* ---- Main ---- */
 
 int main(int argc, char *argv[])
 {
@@ -371,11 +656,11 @@ int main(int argc, char *argv[])
     if (count > 125) count = 125;
 
     /* Open serial port */
-    int fd = open_serial(port, baud, parity, databits, stopbits);
-    if (fd < 0)
+    serial_t ser = open_serial(port, baud, parity, databits, stopbits);
+    if (ser == SERIAL_INVALID)
         return 1;
 
-    int total = to - from + 1;
+    int total_addrs = to - from + 1;
     int found = 0;
 
     fprintf(stderr, "mbscan: scanning %s %d-%c%c%c, addresses %d-%d, timeout %dms\n",
@@ -386,29 +671,30 @@ int main(int argc, char *argv[])
         int progress = addr - from + 1;
 
         if (verbose)
-            fprintf(stderr, "[%d/%d] Trying address %d...\n", progress, total, addr);
+            fprintf(stderr, "[%d/%d] Trying address %d...\n", progress, total_addrs, addr);
         else
-            fprintf(stderr, "\r[%d/%d] Scanning address %d...    ", progress, total, addr);
+            fprintf(stderr, "\r[%d/%d] Scanning address %d...    ", progress, total_addrs, addr);
 
         /* Flush any stale data */
-        tcflush(fd, TCIOFLUSH);
+        flush_serial(ser);
 
         /* Build and send request */
         uint8_t req[8];
         build_fc03_request(req, (uint8_t)addr, (uint16_t)start_reg, (uint16_t)count);
 
-        int written = write(fd, req, 8);
+        int written = write_serial(ser, req, 8);
         if (written != 8) {
+#ifdef _WIN32
+            fprintf(stderr, "\nWrite error at address %d: error %lu\n", addr, GetLastError());
+#else
             fprintf(stderr, "\nWrite error at address %d: %s\n", addr, strerror(errno));
+#endif
             continue;
         }
 
-        /* Wait for response to finish transmitting */
-        tcdrain(fd);
-
         /* Read response */
         uint8_t resp[256];
-        int rlen = read_response(fd, resp, sizeof(resp), timeout);
+        int rlen = read_response(ser, resp, sizeof(resp), timeout);
 
         if (rlen > 0 && validate_response(resp, rlen, (uint8_t)addr)) {
             found++;
@@ -434,6 +720,6 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "\n\nmbscan: done. Found %d device(s).\n", found);
 
-    close(fd);
+    close_serial(ser);
     return found > 0 ? 0 : 1;
 }
