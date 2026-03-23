@@ -203,7 +203,7 @@ The resulting `.ipk` / `.apk` package will be in `bin/packages/*/base/`.
 | 100 ms | ~25 sec | Default, reliable |
 | 200 ms | ~50 sec | Long RS-485 lines |
 
-> **⚠️ Note on short timeouts:** With `-o 10` some devices may not be detected — the 10ms window can be too short for a slave to form and send a response, especially on Windows where USB-Serial driver latency is higher than on Linux. The minimum recommended timeout is **20ms**. If a device is not found, try increasing the timeout before checking wiring or address.
+> **Note on short timeouts:** With `-o 10` some devices may not be detected — the 10ms window can be too short for a slave to form and send a response, especially on Windows where USB-Serial driver latency is higher than on Linux. The minimum recommended timeout is **20ms**. If a device is not found, try increasing the timeout before checking wiring or address.
 
 ## Windows Notes
 
@@ -215,14 +215,30 @@ The resulting `.ipk` / `.apk` package will be in `bin/packages/*/base/`.
 
 `mbscan` is used as the backend for the **Scan Bus** tab in [luci-app-mbpoll](https://github.com/lab240/luci-app-mbpoll) — a LuCI web interface for Modbus device polling and bus scanning on OpenWrt.
 
+## NAPI Boards
+
+This project is developed and maintained by the [NAPI Lab](https://github.com/napilab) team and is primarily tested on NAPI industrial single-board computers based on Rockchip SoCs.
+
+If you are looking for a reliable hardware platform to run `mbscan` in production, check out the NAPI board lineup:
+
+[github.com/napilab/napi-boards](https://github.com/napilab/napi-boards)
+
+- **NAPI2** — RK3568J, RS-485 onboard, Armbian
+- **NAPI-C** — RK3308, compact, industrial grade
+
 ## Hardware
 
 Tested on:
 
-- [NapiLab Napi](https://napiworld.ru) — industrial IoT gateways (RK3308, aarch64, OpenWrt)
+- [NAPI boards](https://github.com/napilab/napi-boards) - industrial IoT gateways (RK3308, RK3568J, aarch64, OpenWrt/Armbian)
 - Standard Linux x86_64 with USB-RS485 adapters (CH341, CP2102, FTDI)
 - Windows 10/11 x86_64 with USB-RS485 adapters
 
+## Authors
+
+- **Dmitrii Novikov** ([@dmnovikov](https://github.com/dmnovikov)) — [NAPI Lab](https://github.com/napilab)
+- **Claude** (Anthropic) — AI assistant and co-author — architecture, code, documentation
+
 ## License
 
-GPL-2.0
+MIT
