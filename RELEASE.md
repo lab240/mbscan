@@ -1,13 +1,29 @@
-# mbscan v1.0.2  — Cross-platform release
-
-**Windows support added.** Single source file now builds natively on Linux, Windows, and cross-compiles for ARM64.
+# mbscan v1.1.1 — Multi-port scan & diagnostics
 
 ## What's New
 
-- **Windows support** — native Win32 serial API (CreateFile, DCB, ReadFile/WriteFile), no POSIX emulation layer
-- **Built-in getopt** for MSVC (no external dependencies on Windows)
-- **COM port handling** — `\\.\` prefix added automatically, COM10+ works without special syntax
-- **ARM64 builds** — cross-compile with standard `gcc-aarch64-linux-gnu`, no OpenWrt toolchain required
+- **Multi-port scanning** — pass multiple ports as arguments or via `-p` with comma-separated list:
+  ```bash
+  mbscan /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyUSB2
+  mbscan /dev/ttyUSB*
+  mbscan -p /dev/ttyUSB0,/dev/ttyUSB1
+  ```
+- **Scan results report** (`-R`) — summary at the end showing port, address, baud/format and register values. Enabled automatically on multi-port or universal scans (`-T`/`-B`/`-D`):
+  ```
+  === Scan results ===
+    /dev/ttyUSB0      Slave   3 at 9600-8E1: [0]=100 [1]=200
+    /dev/ttyUSB1      Slave  17 at 115200-8N1: [0]=50
+  ```
+- **Write error diagnostics** — if 3 consecutive write errors occur, mbscan stops scanning that port, listens passively for 500ms and attempts to identify what is connected:
+  ```
+  mbscan: 3 consecutive write errors on /dev/ttyUSB0 at 9600-8N1
+  mbscan: port may be occupied by another device.
+  mbscan: listening for incoming data (500ms)...
+  mbscan: detected: GPS/NMEA stream
+  mbscan: skipping port /dev/ttyUSB0.
+  ```
+  Detected protocols: GPS/NMEA, AT/LTE modem, ESP8266/ESP32 boot log, Modbus master, unknown text or binary protocol.
+- **Startup warning** — mbscan reminds you to use it only on ports where Modbus sensors are expected.
 
 ## Downloads
 
@@ -23,12 +39,14 @@ All binaries are statically linked — no runtime dependencies, just copy and ru
 
 ```bash
 # Linux
-mbscan -p /dev/ttyUSB0
-mbscan -p /dev/ttyUSB0 -b 9600 -d 8E1 -f 1 -t 30 -c 4
+mbscan /dev/ttyUSB0
+mbscan -T -R /dev/ttyUSB0 /dev/ttyUSB1
+mbscan -b 9600 -d 8E1 -f 1 -t 30 -c 4 /dev/ttyUSB0
 
 # Windows
-mbscan.exe -p COM3
-mbscan.exe -p COM5 -b 9600 -d 8E1 -f 1 -t 30 -c 4
+mbscan.exe COM3
+mbscan.exe -p COM3,COM4 -T -R
+mbscan.exe -b 9600 -d 8E1 -f 1 -t 30 -c 4 COM5
 ```
 
 ## Note on timeouts
